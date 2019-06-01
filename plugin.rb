@@ -119,9 +119,9 @@ class OAuth2BasicAuthenticator < ::Auth::OAuth2Authenticator
 
     result.name = user_details[:name]
     result.username = user_details[:username]
-    result.email = user_details[:email] + "@eveuniversity.org"
+    result.email = user_details[:email].to_s + "@eveuniversity.org"
     result.email_valid = result.email.present? && SiteSetting.oauth2_email_verified?
-    avatar_url = "https://image.eveonline.com/Character/"+user_details[:avatar]+"_256.jpg"
+    avatar_url = "https://image.eveonline.com/Character/"+user_details[:avatar].to_s+"_256.jpg"
 
     current_info = ::PluginStore.get("oauth2_basic", "oauth2_basic_user_#{user_details[:user_id]}")
     if current_info
