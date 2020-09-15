@@ -12,21 +12,83 @@ enabled_site_setting :oauth2_enabled
 
 class ::OmniAuth::Strategies::Oauth2Basic < ::OmniAuth::Strategies::OAuth2
   option :name, "oauth2_basic"
+
+  uid do
+    if path = SiteSetting.oauth2_callback_user_id_path.split('.')
+      recurse(access_token, [*path]) if path.present?
+    end
+  end
+
   info do
-    {
-      id: access_token['id']
-    }
+    if paths = SiteSetting.oauth2_callback_user_info_paths.split('|')
+      result = Hash.new
+      paths.each do |p|
+        segments = p.split(':')
+        if segments.length == 2
+          key = segments.first
+          path = [*segments.last.split('.')]
+          result[key] = recurse(access_token, path)
+        end
+      end
+      result
+    end
   end
 
   def callback_url
     Discourse.base_url_no_prefix + script_name + callback_path
   end
+
+  def recurse(obj, keys)
+    return nil if !obj
+    k = keys.shift
+    result = obj.respond_to?(k) ? obj.send(k) : obj[k]
+    keys.empty? ? result : recurse(result, keys)
+  end
 end
 
-class OAuth2BasicAuthenticator < ::Auth::OAuth2Authenticator
+if Gem::Version.new(Faraday::VERSION) > Gem::Version.new('1.0')
+  require 'faraday/logging/formatter'
+  class OAuth2FaradayFormatter < Faraday::Logging::Formatter
+    def request(env)
+      warn <<~LOG
+        OAuth2 Debugging: request #{env.method.upcase} #{env.url.to_s}
+
+        Headers: #{env.request_headers}
+
+        Body: #{env[:body]}
+      LOG
+    end
+
+    def response(env)
+      warn <<~LOG
+        OAuth2 Debugging: response status #{env.status}
+
+        From #{env.method.upcase} #{env.url.to_s}
+
+        Headers: #{env.response_headers}
+
+        Body: #{env[:body]}
+      LOG
+    end
+  end
+end
+
+class ::OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
+  def name
+    'oauth2_basic'
+  end
+
+  def can_revoke?
+    SiteSetting.oauth2_allow_association_change
+  end
+
+  def can_connect_existing_user?
+    SiteSetting.oauth2_allow_association_change
+  end
+
   def register_middleware(omniauth)
     omniauth.provider :oauth2_basic,
-                      name: 'oauth2_basic',
+                      name: name,
                       setup: lambda { |env|
                         opts = env['omniauth.strategy'].options
                         opts[:client_id] = SiteSetting.oauth2_client_id
@@ -39,11 +101,30 @@ class OAuth2BasicAuthenticator < ::Auth::OAuth2Authenticator
                         }
                         opts[:authorize_options] = SiteSetting.oauth2_authorize_options.split("|").map(&:to_sym)
 
-                        if SiteSetting.oauth2_send_auth_header?
+                        if SiteSetting.oauth2_send_auth_header? && SiteSetting.oauth2_send_auth_body?
+                          # For maximum compatibility we include both header and body auth by default
+                          # This is a little unusual, and utilising multiple authentication methods
+                          # is technically disallowed by the spec (RFC2749 Section 5.2)
+                          opts[:client_options][:auth_scheme] = :request_body
                           opts[:token_params] = { headers: { 'Authorization' => basic_auth_header } }
+                        elsif SiteSetting.oauth2_send_auth_header?
+                          opts[:client_options][:auth_scheme] = :basic_auth
+                        else
+                          opts[:client_options][:auth_scheme] = :request_body
                         end
+
                         unless SiteSetting.oauth2_scope.blank?
                           opts[:scope] = SiteSetting.oauth2_scope
+                        end
+
+                        if SiteSetting.oauth2_debug_auth && defined? OAuth2FaradayFormatter
+                          opts[:client_options][:connection_build] = lambda { |builder|
+                            builder.response :logger, Rails.logger, { bodies: true, formatter: OAuth2FaradayFormatter }
+
+                            # Default stack:
+                            builder.request :url_encoded             # form-encode POST params
+                            builder.adapter Faraday.default_adapter  # make requests with Net::HTTP
+                          }
                         end
                       }
   end
@@ -52,22 +133,39 @@ class OAuth2BasicAuthenticator < ::Auth::OAuth2Authenticator
     "Basic " + Base64.strict_encode64("#{SiteSetting.oauth2_client_id}:#{SiteSetting.oauth2_client_secret}")
   end
 
-  def walk_path(fragment, segments)
-    first_seg = segments[0]
+  def walk_path(fragment, segments, seg_index = 0)
+    first_seg = segments[seg_index]
     return if first_seg.blank? || fragment.blank?
     return nil unless fragment.is_a?(Hash) || fragment.is_a?(Array)
+    first_seg = segments[seg_index].scan(/([\d+])/).length > 0 ? first_seg.split("[")[0] : first_seg
     if fragment.is_a?(Hash)
       deref = fragment[first_seg] || fragment[first_seg.to_sym]
     else
-      deref = fragment[0] # Take just the first array for now, maybe later we can teach it to walk the array if we need to
+      array_index = 0
+      if (seg_index > 0)
+        last_index = segments[seg_index - 1].scan(/([\d+])/).flatten() || [0]
+        array_index = last_index.length > 0 ? last_index[0].to_i : 0
+      end
+      if fragment.any? && fragment.length >= array_index - 1
+        deref = fragment[array_index][first_seg]
+      else
+        deref = nil
+      end
     end
 
-    return (deref.blank? || segments.size == 1) ? deref : walk_path(deref, segments[1..-1])
+    if (deref.blank? || seg_index == segments.size - 1)
+      deref
+    else
+      seg_index += 1
+      walk_path(deref, segments, seg_index)
+    end
   end
 
   def json_walk(result, user_json, prop)
     path = SiteSetting.public_send("oauth2_json_#{prop}_path")
     if path.present?
+      #this.[].that is the same as this.that, allows for both this[0].that and this.[0].that path styles
+      path = path.gsub(".[].", ".").gsub(".[", "[")
       segments = path.split('.')
       val = walk_path(user_json, segments)
       result[prop] = val if val.present?
@@ -85,72 +183,63 @@ class OAuth2BasicAuthenticator < ::Auth::OAuth2Authenticator
     log("user_json_url: #{user_json_method} #{user_json_url}")
 
     bearer_token = "Bearer #{token}"
-    user_json_response =
-      if user_json_method.downcase.to_sym == :post
-        Net::HTTP
-          .post_form(URI(user_json_url), 'Authorization' => bearer_token)
-          .body
+    connection = Excon.new(
+      user_json_url,
+      headers: { 'Authorization' => bearer_token, 'Accept' => 'application/json' }
+    )
+    user_json_response = connection.request(method: user_json_method)
+
+    log("user_json_response: #{user_json_response.inspect}")
+
+    if user_json_response.status == 200
+      user_json = JSON.parse(user_json_response.body)
+
+      log("user_json: #{user_json}")
+
+      result = {}
+      if user_json.present?
+        json_walk(result, user_json, :user_id)
+        json_walk(result, user_json, :username)
+        json_walk(result, user_json, :name)
+        json_walk(result, user_json, :email)
+        json_walk(result, user_json, :email_verified)
+        json_walk(result, user_json, :avatar)
+      end
+      result
+    else
+      nil
+    end
+  end
+
+  def primary_email_verified?(auth)
+    auth['info']['email_verified'] ||
+    SiteSetting.oauth2_email_verified
+  end
+
+  def always_update_user_email?
+    SiteSetting.oauth2_overrides_email
+  end
+
+  def after_authenticate(auth, existing_account: nil)
+    log("after_authenticate response: \n\ncreds: #{auth['credentials'].to_hash}\nuid: #{auth['uid']}\ninfo: #{auth['info'].to_hash}\nextra: #{auth['extra'].to_hash}")
+
+    if SiteSetting.oauth2_fetch_user_details?
+      if fetched_user_details = fetch_user_details(auth['credentials']['token'], auth['uid'])
+        auth['uid'] = fetched_user_details[:user_id] if fetched_user_details[:user_id]
+        auth['info']['nickname'] = fetched_user_details[:username] if fetched_user_details[:username]
+        auth['info']['image'] = fetched_user_details[:avatar] if fetched_user_details[:avatar]
+        ['name', 'email', 'email_verified'].each do |property|
+          auth['info'][property] = fetched_user_details[property.to_sym] if fetched_user_details[property.to_sym]
+        end
       else
-        Excon.get(user_json_url, headers: { 'Authorization' => bearer_token, 'Accept' => 'application/json' }, expects: [200]).body
-      end
-
-    user_json = JSON.parse(user_json_response)
-
-    log("user_json: #{user_json}")
-
-    result = {}
-    if user_json.present?
-      json_walk(result, user_json, :user_id)
-      json_walk(result, user_json, :username)
-      json_walk(result, user_json, :name)
-      json_walk(result, user_json, :email)
-      json_walk(result, user_json, :avatar)
-    end
-
-    result
-  end
-
-  def after_authenticate(auth)
-    log("after_authenticate response: \n\ncreds: #{auth['credentials'].to_hash}\ninfo: #{auth['info'].to_hash}\nextra: #{auth['extra'].to_hash}")
-
-    result = Auth::Result.new
-    token = auth['credentials']['token']
-    user_details = fetch_user_details(token, auth['info'][:id])
-
-    result.name = user_details[:name]
-    result.username = user_details[:username]
-    result.email = user_details[:email].to_s + "@eveuniversity.org"
-    result.email_valid = result.email.present? && SiteSetting.oauth2_email_verified?
-    avatar_url = "https://image.eveonline.com/Character/"+user_details[:avatar].to_s+"_256.jpg"
-
-    current_info = ::PluginStore.get("oauth2_basic", "oauth2_basic_user_#{user_details[:user_id]}")
-    if current_info
-      result.user = User.where(id: current_info[:user_id]).first
-      result.user&.update!(email: result.email) if SiteSetting.oauth2_overrides_email && result.email
-    elsif SiteSetting.oauth2_email_verified?
-      result.user = User.find_by_email(result.email)
-      if result.user && user_details[:user_id]
-        ::PluginStore.set("oauth2_basic", "oauth2_basic_user_#{user_details[:user_id]}", user_id: result.user.id)
+        result = Auth::Result.new
+        result.failed = true
+        result.failed_reason = I18n.t("login.authenticator_error_fetch_user_details")
+        return result
       end
     end
 
-    download_avatar(result.user, avatar_url)
-
-    result.extra_data = { oauth2_basic_user_id: user_details[:user_id], avatar_url: avatar_url }
-    result
-  end
-
-  def after_create_account(user, auth)
-    ::PluginStore.set("oauth2_basic", "oauth2_basic_user_#{auth[:extra_data][:oauth2_basic_user_id]}", user_id: user.id)
-    download_avatar(user, auth[:extra_data][:avatar_url])
-  end
-
-  def download_avatar(user, avatar_url)
-    Jobs.enqueue(:download_avatar_from_url,
-      url: avatar_url,
-      user_id: user.id,
-      override_gravatar: SiteSetting.sso_overrides_avatar
-    ) if user && avatar_url.present?
+    super(auth, existing_account: existing_account)
   end
 
   def enabled?
@@ -159,10 +248,8 @@ class OAuth2BasicAuthenticator < ::Auth::OAuth2Authenticator
 end
 
 auth_provider title_setting: "oauth2_button_title",
-              enabled_setting: "oauth2_enabled",
-              authenticator: OAuth2BasicAuthenticator.new('oauth2_basic'),
-              message: "OAuth2",
-              full_screen_login_setting: "oauth2_full_screen_login"
+              authenticator: OAuth2BasicAuthenticator.new,
+              message: "OAuth2"
 
 register_css <<CSS
 
@@ -171,3 +258,5 @@ register_css <<CSS
   }
 
 CSS
+
+load File.expand_path("../lib/validators/oauth2_basic/oauth2_fetch_user_details_validator.rb", __FILE__)
