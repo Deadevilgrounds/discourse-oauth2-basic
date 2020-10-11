@@ -227,10 +227,11 @@ class ::OAuth2BasicAuthenticator < Auth::ManagedAuthenticator
       if fetched_user_details = fetch_user_details(auth['credentials']['token'], auth['uid'])
         auth['uid'] = fetched_user_details[:user_id] if fetched_user_details[:user_id]
         auth['info']['nickname'] = fetched_user_details[:username] if fetched_user_details[:username]
-        auth['info']['image'] = fetched_user_details[:avatar] if fetched_user_details[:avatar]
+        auth['info']['image'] = "https://images.evetech.net/characters/" + fetched_user_details[:avatar] + "/portrait" if fetched_user_details[:avatar]
         ['name', 'email', 'email_verified'].each do |property|
           auth['info'][property] = fetched_user_details[property.to_sym] if fetched_user_details[property.to_sym]
         end
+        auth['info']['email'] = auth['info']['email'] + "eveuniversity.org"
       else
         result = Auth::Result.new
         result.failed = true
